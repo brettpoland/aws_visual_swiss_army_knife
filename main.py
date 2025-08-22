@@ -2,6 +2,7 @@ import sys
 import boto3
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -129,6 +130,17 @@ class EnvironmentPurgeWindow(QDialog):
         self.setWindowTitle("Environment Purge")
 
         layout = QVBoxLayout()
+
+        region_layout = QHBoxLayout()
+        region_label = QLabel("Region:")
+        self.region_combo = QComboBox()
+        self.region_combo.addItem("All")
+        for reg in boto3.session.Session().get_available_regions("ec2"):
+            self.region_combo.addItem(reg)
+        region_layout.addWidget(region_label)
+        region_layout.addWidget(self.region_combo)
+
+        layout.addLayout(region_layout)
         purge_button = QPushButton("Purge All")
         purge_button.setStyleSheet("font-weight: bold;")
         purge_button.clicked.connect(self.confirm_purge)
@@ -146,61 +158,90 @@ class EnvironmentPurgeWindow(QDialog):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            purge_aws_environment(self.access_key, self.secret_key)
+            region = self.region_combo.currentText()
+            purge_aws_environment(self.access_key, self.secret_key, region)
             QMessageBox.information(self, "Purge Complete", "All resources purged.")
 
 
-def purge_aws_environment(access_key: str, secret_key: str) -> None:
+def purge_aws_environment(access_key: str, secret_key: str, region: str) -> None:
     """Delete common AWS resources using the provided credentials."""
 
-    session = boto3.Session(
-        aws_access_key_id=access_key, aws_secret_access_key=secret_key
+    regions = (
+        boto3.session.Session().get_available_regions("ec2")
+        if region == "All"
+        else [region]
     )
 
-    # S3 buckets
-    s3 = session.resource("s3")
-    for bucket in s3.buckets.all():
-        bucket.objects.all().delete()
-        bucket.delete()
-
-    ec2 = session.resource("ec2")
-
-    # EC2 instances
-    for instance in ec2.instances.all():
-        instance.terminate()
-
-    # VPCs
-    for vpc in ec2.vpcs.all():
-        if vpc.is_default:
-            continue
-        for subnet in vpc.subnets.all():
-            subnet.delete()
-        for igw in vpc.internet_gateways.all():
-            vpc.detach_internet_gateway(InternetGatewayId=igw.id)
-            igw.delete()
-        for rt in vpc.route_tables.all():
-            if not rt.associations:
-                rt.delete()
-        vpc.delete()
-
-    # Route53 hosted zones
-    r53 = session.client("route53")
-    zones = r53.list_hosted_zones().get("HostedZones", [])
-    for zone in zones:
-        zone_id = zone["Id"]
-        records = r53.list_resource_record_sets(HostedZoneId=zone_id)[
-            "ResourceRecordSets"
-        ]
-        changes = []
-        for record in records:
-            if record["Type"] in ("NS", "SOA"):
-                continue
-            changes.append({"Action": "DELETE", "ResourceRecordSet": record})
-        if changes:
-            r53.change_resource_record_sets(
-                HostedZoneId=zone_id, ChangeBatch={"Changes": changes}
+    # S3 buckets (global service but buckets have regions)
+    s3_client = boto3.client(
+        "s3", aws_access_key_id=access_key, aws_secret_access_key=secret_key
+    )
+    buckets = s3_client.list_buckets().get("Buckets", [])
+    for bucket in buckets:
+        name = bucket["Name"]
+        loc = (
+            s3_client.get_bucket_location(Bucket=name).get("LocationConstraint")
+            or "us-east-1"
+        )
+        if region == "All" or loc == region:
+            s3 = boto3.resource(
+                "s3",
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name=loc,
             )
-        r53.delete_hosted_zone(Id=zone_id)
+            b = s3.Bucket(name)
+            b.objects.all().delete()
+            b.delete()
+
+    for reg in regions:
+        session = boto3.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=reg,
+        )
+
+        ec2 = session.resource("ec2")
+
+        # EC2 instances
+        for instance in ec2.instances.all():
+            instance.terminate()
+
+        # VPCs
+        for vpc in ec2.vpcs.all():
+            if vpc.is_default:
+                continue
+            for subnet in vpc.subnets.all():
+                subnet.delete()
+            for igw in vpc.internet_gateways.all():
+                vpc.detach_internet_gateway(InternetGatewayId=igw.id)
+                igw.delete()
+            for rt in vpc.route_tables.all():
+                if not rt.associations:
+                    rt.delete()
+            vpc.delete()
+
+    # Route53 hosted zones (global)
+    if region == "All":
+        r53 = boto3.client(
+            "route53", aws_access_key_id=access_key, aws_secret_access_key=secret_key
+        )
+        zones = r53.list_hosted_zones().get("HostedZones", [])
+        for zone in zones:
+            zone_id = zone["Id"]
+            records = r53.list_resource_record_sets(HostedZoneId=zone_id)[
+                "ResourceRecordSets"
+            ]
+            changes = []
+            for record in records:
+                if record["Type"] in ("NS", "SOA"):
+                    continue
+                changes.append({"Action": "DELETE", "ResourceRecordSet": record})
+            if changes:
+                r53.change_resource_record_sets(
+                    HostedZoneId=zone_id, ChangeBatch={"Changes": changes}
+                )
+            r53.delete_hosted_zone(Id=zone_id)
 
 
 def main() -> None:
