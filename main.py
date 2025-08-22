@@ -1,4 +1,5 @@
 import sys
+import boto3
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
@@ -6,6 +7,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -39,19 +41,43 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout()
         main_widget.setLayout(main_layout)
 
-        # Top bar with AWS key entry
+        # Top bar with title and credentials
         top_bar = QWidget()
         top_bar.setStyleSheet("background-color: #005FCE;")
-        top_layout = QHBoxLayout()
+        top_layout = QVBoxLayout()
         top_bar.setLayout(top_layout)
 
-        key_label = QLabel("AWS Access Key:")
-        key_label.setStyleSheet("color: white; font-weight: bold;")
-        self.access_key_edit = QLineEdit()
-        self.access_key_edit.setPlaceholderText("Enter your key")
+        title_label = QLabel("AWS Swiss Army Knife")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet(
+            "color: white; font-size: 18px; font-weight: bold; padding: 5px;"
+        )
 
-        top_layout.addWidget(key_label)
-        top_layout.addWidget(self.access_key_edit)
+        creds_box = QWidget()
+        creds_box.setStyleSheet(
+            "background-color: #E0E0E0; border-radius: 4px; padding: 5px;"
+        )
+        creds_layout = QVBoxLayout()
+        creds_box.setLayout(creds_layout)
+
+        access_layout = QHBoxLayout()
+        access_label = QLabel("Access Key:")
+        self.access_key_edit = QLineEdit()
+        access_layout.addWidget(access_label)
+        access_layout.addWidget(self.access_key_edit)
+
+        secret_layout = QHBoxLayout()
+        secret_label = QLabel("Secret Key:")
+        self.secret_key_edit = QLineEdit()
+        self.secret_key_edit.setEchoMode(QLineEdit.Password)
+        secret_layout.addWidget(secret_label)
+        secret_layout.addWidget(self.secret_key_edit)
+
+        creds_layout.addLayout(access_layout)
+        creds_layout.addLayout(secret_layout)
+
+        top_layout.addWidget(title_label)
+        top_layout.addWidget(creds_box)
 
         main_layout.addWidget(top_bar)
 
@@ -62,7 +88,7 @@ class MainWindow(QMainWindow):
         s3_button.clicked.connect(lambda: self.open_subwindow("S3 Nuke"))
 
         env_button = QPushButton("Environment Purge")
-        env_button.clicked.connect(lambda: self.open_subwindow("Environment Purge"))
+        env_button.clicked.connect(self.open_env_purge)
 
         lab_button = QPushButton("Lab Setup")
         lab_button.clicked.connect(lambda: self.open_subwindow("Lab Setup"))
@@ -83,6 +109,98 @@ class MainWindow(QMainWindow):
 
         window = SubWindow(title)
         window.exec_()
+
+    def open_env_purge(self) -> None:
+        """Open the environment purge dialog with provided credentials."""
+
+        access_key = self.access_key_edit.text()
+        secret_key = self.secret_key_edit.text()
+        window = EnvironmentPurgeWindow(access_key, secret_key)
+        window.exec_()
+
+
+class EnvironmentPurgeWindow(QDialog):
+    """Dialog to purge an AWS environment."""
+
+    def __init__(self, access_key: str, secret_key: str):
+        super().__init__()
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.setWindowTitle("Environment Purge")
+
+        layout = QVBoxLayout()
+        purge_button = QPushButton("Purge All")
+        purge_button.setStyleSheet("font-weight: bold;")
+        purge_button.clicked.connect(self.confirm_purge)
+
+        layout.addWidget(purge_button)
+        self.setLayout(layout)
+
+    def confirm_purge(self) -> None:
+        """Ask for confirmation before purging resources."""
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Purge",
+            "Are you sure you want to purge all resources?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            purge_aws_environment(self.access_key, self.secret_key)
+            QMessageBox.information(self, "Purge Complete", "All resources purged.")
+
+
+def purge_aws_environment(access_key: str, secret_key: str) -> None:
+    """Delete common AWS resources using the provided credentials."""
+
+    session = boto3.Session(
+        aws_access_key_id=access_key, aws_secret_access_key=secret_key
+    )
+
+    # S3 buckets
+    s3 = session.resource("s3")
+    for bucket in s3.buckets.all():
+        bucket.objects.all().delete()
+        bucket.delete()
+
+    ec2 = session.resource("ec2")
+
+    # EC2 instances
+    for instance in ec2.instances.all():
+        instance.terminate()
+
+    # VPCs
+    for vpc in ec2.vpcs.all():
+        if vpc.is_default:
+            continue
+        for subnet in vpc.subnets.all():
+            subnet.delete()
+        for igw in vpc.internet_gateways.all():
+            vpc.detach_internet_gateway(InternetGatewayId=igw.id)
+            igw.delete()
+        for rt in vpc.route_tables.all():
+            if not rt.associations:
+                rt.delete()
+        vpc.delete()
+
+    # Route53 hosted zones
+    r53 = session.client("route53")
+    zones = r53.list_hosted_zones().get("HostedZones", [])
+    for zone in zones:
+        zone_id = zone["Id"]
+        records = r53.list_resource_record_sets(HostedZoneId=zone_id)[
+            "ResourceRecordSets"
+        ]
+        changes = []
+        for record in records:
+            if record["Type"] in ("NS", "SOA"):
+                continue
+            changes.append({"Action": "DELETE", "ResourceRecordSet": record})
+        if changes:
+            r53.change_resource_record_sets(
+                HostedZoneId=zone_id, ChangeBatch={"Changes": changes}
+            )
+        r53.delete_hosted_zone(Id=zone_id)
 
 
 def main() -> None:
