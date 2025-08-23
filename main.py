@@ -4,6 +4,7 @@ import boto3
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -96,7 +97,7 @@ class MainWindow(QMainWindow):
         env_button.clicked.connect(self.open_env_purge)
 
         lab_button = QPushButton("Lab Setup")
-        lab_button.clicked.connect(lambda: self.open_subwindow("Lab Setup"))
+        lab_button.clicked.connect(self.open_lab_setup)
 
         for button in (s3_button, env_button, lab_button):
             button.setMinimumHeight(40)
@@ -129,6 +130,14 @@ class MainWindow(QMainWindow):
         access_key = self.access_key_edit.text()
         secret_key = self.secret_key_edit.text()
         window = S3NukeWindow(access_key, secret_key)
+        window.exec_()
+
+    def open_lab_setup(self) -> None:
+        """Open the lab setup dialog with provided credentials."""
+
+        access_key = self.access_key_edit.text()
+        secret_key = self.secret_key_edit.text()
+        window = LabSetupWindow(access_key, secret_key)
         window.exec_()
 
 
@@ -284,6 +293,45 @@ class S3NukeWindow(QDialog):
             QMessageBox.information(self, "Nuked", "All buckets deleted")
 
 
+class LabSetupWindow(QDialog):
+    """Create a simple lab VPC with optional NAT gateway."""
+
+    def __init__(self, access_key: str, secret_key: str):
+        super().__init__()
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.setWindowTitle("Lab Setup")
+
+        layout = QVBoxLayout()
+
+        region_layout = QHBoxLayout()
+        region_label = QLabel("Region:")
+        self.region_combo = QComboBox()
+        for reg in boto3.session.Session().get_available_regions("ec2"):
+            self.region_combo.addItem(reg)
+        region_layout.addWidget(region_label)
+        region_layout.addWidget(self.region_combo)
+        layout.addLayout(region_layout)
+
+        self.nat_checkbox = QCheckBox("Create NAT Gateway")
+        layout.addWidget(self.nat_checkbox)
+
+        create_btn = QPushButton("Create Lab")
+        create_btn.clicked.connect(self.create_lab)
+        layout.addWidget(create_btn)
+        self.setLayout(layout)
+
+    def create_lab(self) -> None:
+        region = self.region_combo.currentText()
+        use_nat = self.nat_checkbox.isChecked()
+        try:
+            setup_lab_environment(self.access_key, self.secret_key, region, use_nat)
+            QMessageBox.information(self, "Lab Setup", "Lab environment created")
+            self.accept()
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", str(exc))
+
+
 class EnvironmentPurgeWindow(QDialog):
     """Dialog to purge an AWS environment."""
 
@@ -327,6 +375,44 @@ class EnvironmentPurgeWindow(QDialog):
             QMessageBox.information(self, "Purge Complete", "All resources purged.")
 
 
+def setup_lab_environment(access_key: str, secret_key: str, region: str, with_nat: bool) -> None:
+    """Create a basic VPC with public/private subnets and optional NAT."""
+
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+    ec2 = session.resource("ec2")
+    client = session.client("ec2")
+
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+    vpc.wait_until_available()
+    igw = ec2.create_internet_gateway()
+    vpc.attach_internet_gateway(InternetGatewayId=igw.id)
+
+    az = client.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
+
+    public_subnet = vpc.create_subnet(CidrBlock="10.0.1.0/24", AvailabilityZone=az)
+    private_subnet = vpc.create_subnet(CidrBlock="10.0.2.0/24", AvailabilityZone=az)
+
+    client.modify_subnet_attribute(SubnetId=public_subnet.id, MapPublicIpOnLaunch={"Value": True})
+
+    public_rt = vpc.create_route_table()
+    public_rt.create_route(DestinationCidrBlock="0.0.0.0/0", GatewayId=igw.id)
+    public_rt.associate_with_subnet(SubnetId=public_subnet.id)
+
+    private_rt = vpc.create_route_table()
+    private_rt.associate_with_subnet(SubnetId=private_subnet.id)
+
+    if with_nat:
+        eip = client.allocate_address(Domain="vpc")
+        nat = client.create_nat_gateway(SubnetId=public_subnet.id, AllocationId=eip["AllocationId"])
+        nat_id = nat["NatGateway"]["NatGatewayId"]
+        client.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat_id])
+        private_rt.create_route(DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_id)
+
+
 def purge_aws_environment(access_key: str, secret_key: str, region: str) -> None:
     """Delete common AWS resources using the provided credentials."""
 
@@ -366,6 +452,7 @@ def purge_aws_environment(access_key: str, secret_key: str, region: str) -> None
         )
 
         ec2 = session.resource("ec2")
+        ec2_client = session.client("ec2")
 
         # EC2 instances
         for instance in ec2.instances.all():
@@ -375,6 +462,18 @@ def purge_aws_environment(access_key: str, secret_key: str, region: str) -> None
         for vpc in ec2.vpcs.all():
             if vpc.is_default:
                 continue
+            nat_gws = ec2_client.describe_nat_gateways(
+                Filters=[{"Name": "vpc-id", "Values": [vpc.id]}]
+            ).get("NatGateways", [])
+            for nat in nat_gws:
+                ec2_client.delete_nat_gateway(NatGatewayId=nat["NatGatewayId"])
+                for addr in nat.get("NatGatewayAddresses", []):
+                    alloc_id = addr.get("AllocationId")
+                    if alloc_id:
+                        try:
+                            ec2_client.release_address(AllocationId=alloc_id)
+                        except Exception:
+                            pass
             for subnet in vpc.subnets.all():
                 subnet.delete()
             for igw in vpc.internet_gateways.all():
