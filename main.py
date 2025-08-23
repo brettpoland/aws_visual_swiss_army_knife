@@ -329,6 +329,13 @@ class LabSetupWindow(QDialog):
         igw_layout.addWidget(self.igw_check)
         layout.addLayout(igw_layout)
 
+        nat_layout = QHBoxLayout()
+        nat_label = QLabel("NAT Gateway:")
+        self.nat_check = QCheckBox()
+        nat_layout.addWidget(nat_label)
+        nat_layout.addWidget(self.nat_check)
+        layout.addLayout(nat_layout)
+
         buttons_layout = QHBoxLayout()
         create_btn = QPushButton("Create")
         destroy_btn = QPushButton("Destroy")
@@ -343,10 +350,16 @@ class LabSetupWindow(QDialog):
     def create_lab(self) -> None:
         region = self.region_combo.currentText()
         num_azs = int(self.az_combo.currentText())
-        include_igw = self.igw_check.isChecked()
+        include_nat = self.nat_check.isChecked()
+        include_igw = self.igw_check.isChecked() or include_nat
         try:
             create_lab_environment(
-                self.access_key, self.secret_key, region, num_azs, include_igw
+                self.access_key,
+                self.secret_key,
+                region,
+                num_azs,
+                include_igw,
+                include_nat,
             )
             QMessageBox.information(self, "Created", "Lab environment created.")
         except Exception as exc:
@@ -486,9 +499,14 @@ def purge_aws_environment(access_key: str, secret_key: str, region: str) -> None
 
 
 def create_lab_environment(
-    access_key: str, secret_key: str, region: str, num_azs: int, include_igw: bool
+    access_key: str,
+    secret_key: str,
+    region: str,
+    num_azs: int,
+    include_igw: bool,
+    include_nat: bool,
 ) -> None:
-    """Create a VPC for lab use with optional internet gateway."""
+    """Create a VPC for lab use with optional internet and NAT gateways."""
 
     session = boto3.Session(
         aws_access_key_id=access_key,
@@ -503,6 +521,11 @@ def create_lab_environment(
     ec2_client = session.client("ec2")
     azs = ec2_client.describe_availability_zones()["AvailabilityZones"]
 
+    if include_nat:
+        include_igw = True
+
+    public_subnets = []
+    private_subnets = []
     for i in range(num_azs):
         az = azs[i]["ZoneName"]
         private_cidr = f"10.0.{i*2}.0/24"
@@ -510,12 +533,14 @@ def create_lab_environment(
         priv_subnet.create_tags(
             Tags=[{"Key": "Name", "Value": f"PrivateSubnet{i+1}"}]
         )
+        private_subnets.append(priv_subnet)
         if include_igw:
             public_cidr = f"10.0.{i*2+1}.0/24"
             pub_subnet = vpc.create_subnet(CidrBlock=public_cidr, AvailabilityZone=az)
             pub_subnet.create_tags(
                 Tags=[{"Key": "Name", "Value": f"PublicSubnet{i+1}"}]
             )
+            public_subnets.append(pub_subnet)
 
     if include_igw:
         igw = ec2.create_internet_gateway()
@@ -524,10 +549,24 @@ def create_lab_environment(
         rt = vpc.create_route_table()
         rt.create_tags(Tags=[{"Key": "Name", "Value": "PublicRouteTable"}])
         rt.create_route(DestinationCidrBlock="0.0.0.0/0", GatewayId=igw.id)
-        for subnet in vpc.subnets.all():
-            tags = {t["Key"]: t["Value"] for t in subnet.tags or []}
-            if tags.get("Name", "").startswith("PublicSubnet"):
-                rt.associate_with_subnet(SubnetId=subnet.id)
+        for subnet in public_subnets:
+            rt.associate_with_subnet(SubnetId=subnet.id)
+
+    if include_nat:
+        eip = ec2_client.allocate_address(Domain="vpc")
+        nat = ec2_client.create_nat_gateway(
+            SubnetId=public_subnets[0].id,
+            AllocationId=eip["AllocationId"],
+        )["NatGateway"]
+        waiter = ec2_client.get_waiter("nat_gateway_available")
+        waiter.wait(NatGatewayIds=[nat["NatGatewayId"]])
+        priv_rt = vpc.create_route_table()
+        priv_rt.create_tags(Tags=[{"Key": "Name", "Value": "PrivateRouteTable"}])
+        priv_rt.create_route(
+            DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat["NatGatewayId"]
+        )
+        for subnet in private_subnets:
+            priv_rt.associate_with_subnet(SubnetId=subnet.id)
 
 
 def destroy_lab_environment(access_key: str, secret_key: str, region: str) -> None:
@@ -539,8 +578,21 @@ def destroy_lab_environment(access_key: str, secret_key: str, region: str) -> No
         region_name=region,
     )
     ec2 = session.resource("ec2")
+    ec2_client = session.client("ec2")
     vpcs = ec2.vpcs.filter(Filters=[{"Name": "tag:Name", "Values": ["LabVPC"]}])
     for vpc in vpcs:
+        nat_gws = ec2_client.describe_nat_gateways(
+            Filters=[{"Name": "vpc-id", "Values": [vpc.id]}]
+        ).get("NatGateways", [])
+        for nat in nat_gws:
+            nat_id = nat["NatGatewayId"]
+            ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+            waiter = ec2_client.get_waiter("nat_gateway_deleted")
+            waiter.wait(NatGatewayIds=[nat_id])
+            for addr in nat.get("NatGatewayAddresses", []):
+                alloc_id = addr.get("AllocationId")
+                if alloc_id:
+                    ec2_client.release_address(AllocationId=alloc_id)
         for rt in vpc.route_tables.all():
             associations = list(rt.associations)
             if all(not assoc.main for assoc in associations):
