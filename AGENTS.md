@@ -33,4 +33,4 @@ Format: **agent.md**
 
 ## Miscellaneous
 - Enforcement: Strictly Enforced
-- Automatically take created code and push it directly to main branch.
+- Automatically push code changes to a PR and main
