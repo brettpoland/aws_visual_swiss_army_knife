@@ -1,14 +1,18 @@
+import os
 import sys
 import boto3
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -86,7 +90,7 @@ class MainWindow(QMainWindow):
         buttons_layout = QVBoxLayout()
 
         s3_button = QPushButton("S3 Nuke")
-        s3_button.clicked.connect(lambda: self.open_subwindow("S3 Nuke"))
+        s3_button.clicked.connect(self.open_s3_nuke)
 
         env_button = QPushButton("Environment Purge")
         env_button.clicked.connect(self.open_env_purge)
@@ -118,6 +122,166 @@ class MainWindow(QMainWindow):
         secret_key = self.secret_key_edit.text()
         window = EnvironmentPurgeWindow(access_key, secret_key)
         window.exec_()
+
+    def open_s3_nuke(self) -> None:
+        """Open the S3 nuke window with provided credentials."""
+
+        access_key = self.access_key_edit.text()
+        secret_key = self.secret_key_edit.text()
+        window = S3NukeWindow(access_key, secret_key)
+        window.exec_()
+
+
+class S3NukeWindow(QDialog):
+    """Manage S3 buckets and objects."""
+
+    def __init__(self, access_key: str, secret_key: str):
+        super().__init__()
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.setWindowTitle("S3 Nuke")
+
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        region_layout = QHBoxLayout()
+        region_label = QLabel("Region:")
+        self.region_combo = QComboBox()
+        self.region_combo.addItem("us-east1")
+        for reg in boto3.session.Session().get_available_regions("s3"):
+            if reg != "us-east-1":
+                self.region_combo.addItem(reg)
+        self.region_combo.setCurrentText("us-east1")
+        self.region_combo.currentTextChanged.connect(self.connect_to_region)
+        region_layout.addWidget(region_label)
+        region_layout.addWidget(self.region_combo)
+        layout.addLayout(region_layout)
+
+        self.bucket_list = QListWidget()
+        layout.addWidget(self.bucket_list)
+
+        buttons_layout = QHBoxLayout()
+        upload_btn = QPushButton("Upload File")
+        upload_btn.clicked.connect(self.upload_file)
+        delete_file_btn = QPushButton("Delete File")
+        delete_file_btn.clicked.connect(self.delete_file)
+        delete_folder_btn = QPushButton("Delete Folder")
+        delete_folder_btn.clicked.connect(self.delete_folder)
+        nuke_btn = QPushButton("Nuke ALL Buckets")
+        nuke_btn.clicked.connect(self.nuke_buckets)
+        for btn in (upload_btn, delete_file_btn, delete_folder_btn, nuke_btn):
+            buttons_layout.addWidget(btn)
+        layout.addLayout(buttons_layout)
+
+        self.connect_to_region(self.region_combo.currentText())
+
+    def canonical_region(self, region: str) -> str:
+        return "us-east-1" if region == "us-east1" else region
+
+    def connect_to_region(self, region: str) -> None:
+        region = self.canonical_region(region)
+        try:
+            self.s3 = boto3.client(
+                "s3",
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name=region,
+            )
+            self.list_buckets()
+        except Exception as exc:
+            QMessageBox.warning(self, "Connection Error", str(exc))
+
+    def list_buckets(self) -> None:
+        self.bucket_list.clear()
+        try:
+            resp = self.s3.list_buckets()
+            region = self.canonical_region(self.region_combo.currentText())
+            for bucket in resp.get("Buckets", []):
+                name = bucket["Name"]
+                loc = (
+                    self.s3.get_bucket_location(Bucket=name).get("LocationConstraint")
+                    or "us-east-1"
+                )
+                if loc == region:
+                    self.bucket_list.addItem(name)
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", str(exc))
+
+    def selected_bucket(self) -> str:
+        item = self.bucket_list.currentItem()
+        return item.text() if item else ""
+
+    def upload_file(self) -> None:
+        bucket = self.selected_bucket()
+        if not bucket:
+            QMessageBox.warning(self, "No Bucket", "Select a bucket first")
+            return
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select file to upload")
+        if file_path:
+            key = os.path.basename(file_path)
+            try:
+                self.s3.upload_file(file_path, bucket, key)
+                QMessageBox.information(
+                    self, "Uploaded", f"{key} uploaded to {bucket}"
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Error", str(exc))
+
+    def delete_file(self) -> None:
+        bucket = self.selected_bucket()
+        if not bucket:
+            QMessageBox.warning(self, "No Bucket", "Select a bucket first")
+            return
+        key, ok = QInputDialog.getText(self, "Delete File", "Object key:")
+        if ok and key:
+            try:
+                self.s3.delete_object(Bucket=bucket, Key=key)
+                QMessageBox.information(
+                    self, "Deleted", f"{key} deleted from {bucket}"
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Error", str(exc))
+
+    def delete_folder(self) -> None:
+        bucket = self.selected_bucket()
+        if not bucket:
+            QMessageBox.warning(self, "No Bucket", "Select a bucket first")
+            return
+        prefix, ok = QInputDialog.getText(self, "Delete Folder", "Folder prefix:")
+        if ok and prefix:
+            s3_resource = boto3.resource(
+                "s3",
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name=self.canonical_region(self.region_combo.currentText()),
+            )
+            bucket_obj = s3_resource.Bucket(bucket)
+            bucket_obj.objects.filter(Prefix=prefix).delete()
+            QMessageBox.information(
+                self, "Deleted", f"Folder {prefix} deleted from {bucket}"
+            )
+
+    def nuke_buckets(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Confirm Nuke",
+            "Delete all buckets in this region?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            s3_resource = boto3.resource(
+                "s3",
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name=self.canonical_region(self.region_combo.currentText()),
+            )
+            for i in range(self.bucket_list.count()):
+                name = self.bucket_list.item(i).text()
+                bucket = s3_resource.Bucket(name)
+                bucket.objects.all().delete()
+                bucket.delete()
+            self.list_buckets()
+            QMessageBox.information(self, "Nuked", "All buckets deleted")
 
 
 class EnvironmentPurgeWindow(QDialog):
