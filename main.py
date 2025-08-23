@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QInputDialog,
+    QCheckBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -96,7 +97,7 @@ class MainWindow(QMainWindow):
         env_button.clicked.connect(self.open_env_purge)
 
         lab_button = QPushButton("Lab Setup")
-        lab_button.clicked.connect(lambda: self.open_subwindow("Lab Setup"))
+        lab_button.clicked.connect(self.open_lab_setup)
 
         for button in (s3_button, env_button, lab_button):
             button.setMinimumHeight(40)
@@ -121,6 +122,14 @@ class MainWindow(QMainWindow):
         access_key = self.access_key_edit.text()
         secret_key = self.secret_key_edit.text()
         window = EnvironmentPurgeWindow(access_key, secret_key)
+        window.exec_()
+
+    def open_lab_setup(self) -> None:
+        """Open the lab setup dialog with provided credentials."""
+
+        access_key = self.access_key_edit.text()
+        secret_key = self.secret_key_edit.text()
+        window = LabSetupWindow(access_key, secret_key)
         window.exec_()
 
     def open_s3_nuke(self) -> None:
@@ -284,6 +293,74 @@ class S3NukeWindow(QDialog):
             QMessageBox.information(self, "Nuked", "All buckets deleted")
 
 
+class LabSetupWindow(QDialog):
+    """Dialog to create or destroy a simple lab VPC."""
+
+    def __init__(self, access_key: str, secret_key: str):
+        super().__init__()
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.setWindowTitle("Lab Setup")
+
+        layout = QVBoxLayout()
+
+        region_layout = QHBoxLayout()
+        region_label = QLabel("Region:")
+        self.region_combo = QComboBox()
+        for reg in boto3.session.Session().get_available_regions("ec2"):
+            self.region_combo.addItem(reg)
+        region_layout.addWidget(region_label)
+        region_layout.addWidget(self.region_combo)
+        layout.addLayout(region_layout)
+
+        az_layout = QHBoxLayout()
+        az_label = QLabel("Availability Zones:")
+        self.az_combo = QComboBox()
+        for i in range(1, 4):
+            self.az_combo.addItem(str(i))
+        az_layout.addWidget(az_label)
+        az_layout.addWidget(self.az_combo)
+        layout.addLayout(az_layout)
+
+        igw_layout = QHBoxLayout()
+        igw_label = QLabel("Internet Gateway:")
+        self.igw_check = QCheckBox()
+        igw_layout.addWidget(igw_label)
+        igw_layout.addWidget(self.igw_check)
+        layout.addLayout(igw_layout)
+
+        buttons_layout = QHBoxLayout()
+        create_btn = QPushButton("Create")
+        destroy_btn = QPushButton("Destroy")
+        create_btn.clicked.connect(self.create_lab)
+        destroy_btn.clicked.connect(self.destroy_lab)
+        buttons_layout.addWidget(create_btn)
+        buttons_layout.addWidget(destroy_btn)
+        layout.addLayout(buttons_layout)
+
+        self.setLayout(layout)
+
+    def create_lab(self) -> None:
+        region = self.region_combo.currentText()
+        num_azs = int(self.az_combo.currentText())
+        include_igw = self.igw_check.isChecked()
+        try:
+            create_lab_environment(
+                self.access_key, self.secret_key, region, num_azs, include_igw
+            )
+            QMessageBox.information(self, "Created", "Lab environment created.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", str(exc))
+
+    def destroy_lab(self) -> None:
+        region = self.region_combo.currentText()
+        try:
+            destroy_lab_environment(self.access_key, self.secret_key, region)
+            QMessageBox.information(self, "Destroyed", "Lab environment destroyed.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", str(exc))
+
+
 class EnvironmentPurgeWindow(QDialog):
     """Dialog to purge an AWS environment."""
 
@@ -406,6 +483,74 @@ def purge_aws_environment(access_key: str, secret_key: str, region: str) -> None
                     HostedZoneId=zone_id, ChangeBatch={"Changes": changes}
                 )
             r53.delete_hosted_zone(Id=zone_id)
+
+
+def create_lab_environment(
+    access_key: str, secret_key: str, region: str, num_azs: int, include_igw: bool
+) -> None:
+    """Create a VPC for lab use with optional internet gateway."""
+
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+    ec2 = session.resource("ec2")
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+    vpc.wait_until_available()
+    vpc.create_tags(Tags=[{"Key": "Name", "Value": "LabVPC"}])
+
+    ec2_client = session.client("ec2")
+    azs = ec2_client.describe_availability_zones()["AvailabilityZones"]
+
+    for i in range(num_azs):
+        az = azs[i]["ZoneName"]
+        private_cidr = f"10.0.{i*2}.0/24"
+        priv_subnet = vpc.create_subnet(CidrBlock=private_cidr, AvailabilityZone=az)
+        priv_subnet.create_tags(
+            Tags=[{"Key": "Name", "Value": f"PrivateSubnet{i+1}"}]
+        )
+        if include_igw:
+            public_cidr = f"10.0.{i*2+1}.0/24"
+            pub_subnet = vpc.create_subnet(CidrBlock=public_cidr, AvailabilityZone=az)
+            pub_subnet.create_tags(
+                Tags=[{"Key": "Name", "Value": f"PublicSubnet{i+1}"}]
+            )
+
+    if include_igw:
+        igw = ec2.create_internet_gateway()
+        igw.create_tags(Tags=[{"Key": "Name", "Value": "LabIGW"}])
+        vpc.attach_internet_gateway(InternetGatewayId=igw.id)
+        rt = vpc.create_route_table()
+        rt.create_tags(Tags=[{"Key": "Name", "Value": "PublicRouteTable"}])
+        rt.create_route(DestinationCidrBlock="0.0.0.0/0", GatewayId=igw.id)
+        for subnet in vpc.subnets.all():
+            tags = {t["Key"]: t["Value"] for t in subnet.tags or []}
+            if tags.get("Name", "").startswith("PublicSubnet"):
+                rt.associate_with_subnet(SubnetId=subnet.id)
+
+
+def destroy_lab_environment(access_key: str, secret_key: str, region: str) -> None:
+    """Delete the lab VPC and related resources."""
+
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+    ec2 = session.resource("ec2")
+    vpcs = ec2.vpcs.filter(Filters=[{"Name": "tag:Name", "Values": ["LabVPC"]}])
+    for vpc in vpcs:
+        for rt in vpc.route_tables.all():
+            associations = list(rt.associations)
+            if all(not assoc.main for assoc in associations):
+                rt.delete()
+        for igw in vpc.internet_gateways.all():
+            vpc.detach_internet_gateway(InternetGatewayId=igw.id)
+            igw.delete()
+        for subnet in vpc.subnets.all():
+            subnet.delete()
+        vpc.delete()
 
 
 def main() -> None:
